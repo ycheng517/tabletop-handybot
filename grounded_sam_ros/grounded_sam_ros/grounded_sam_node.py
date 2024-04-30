@@ -23,7 +23,7 @@ SAM_ENCODER_VERSION = "vit_h"
 SAM_CHECKPOINT_PATH = "/home/yifei/src/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
-CLASSES = ["toy . bowl"]
+CLASSES = ["toy . plate"]
 BOX_THRESHOLD = 0.25
 TEXT_THRESHOLD = 0.25
 NMS_THRESHOLD = 0.8
@@ -131,7 +131,7 @@ class GroundedSAMNode(Node):
         self._last_depth_msg = msg
 
     def image_callback(self, msg):
-        if not self._start:
+        if not self._start or not self._last_depth_msg:
             return
 
         self._logger.info('Handling image...')
@@ -177,6 +177,7 @@ class GroundedSAMNode(Node):
         masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
         for mask in detections.mask:
             masked_depth_image[mask] = depth_image[mask]
+        masked_depth_image /= 1000.0
 
         # convert the masked depth image to a point cloud
         pcd = o3d.geometry.PointCloud.create_from_depth_image(
@@ -186,7 +187,7 @@ class GroundedSAMNode(Node):
 
         # convert it to a ROS PointCloud2 message
         points = np.asarray(pcd.points)
-        pc_msg = point_cloud(points, msg.header.frame_id)
+        pc_msg = point_cloud(points, "/camera_color_frame")
         self.point_cloud_pub.publish(pc_msg)
 
         self.n_frames_processed += 1
