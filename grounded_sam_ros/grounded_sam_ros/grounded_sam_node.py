@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import Empty, Header
+from std_msgs.msg import Empty, Header, String
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
@@ -11,6 +11,9 @@ import torchvision
 from groundingdino.util.inference import Model
 from segment_anything import sam_model_registry, SamPredictor
 import open3d as o3d
+
+from openai_assistant import get_or_create_assistant
+from openai.types.beta import Assistant
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -97,45 +100,39 @@ class GroundedSAMNode(Node):
         super().__init__('grounded_sam_node')
 
         self._logger = self.get_logger()
+
+        self.grounding_dino_model = Model(
+            model_config_path=GROUNDING_DINO_CONFIG_PATH,
+            model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH)
+        self.sam = sam_model_registry[SAM_ENCODER_VERSION](
+            checkpoint=SAM_CHECKPOINT_PATH)
+        self.sam.to(device=DEVICE)
+        self.sam_predictor = SamPredictor(self.sam)
+        self.assistant: Assistant = get_or_create_assistant()
+        self.cv_bridge = CvBridge()
+
+        self.annotate = annotate
+        self.n_frames_processed = 0
+        self._last_depth_msg = None
+        self._last_rgb_msg = None
+
         self.image_sub = self.create_subscription(Image,
                                                   '/camera/color/image_raw',
                                                   self.image_callback, 10)
         self.depth_sub = self.create_subscription(
             Image, '/camera/aligned_depth_to_color/image_raw',
             self.depth_callback, 10)
-        self.start_sub = self.create_subscription(Empty, '/start', self.start,
-                                                  10)
 
         self.point_cloud_pub = self.create_publisher(
             PointCloud2, '/grounded_sam/point_cloud', 2)
+        self.prompt_sub = self.create_subscription(String, '/prompt', self.start, 10)
 
-        self.grounding_dino_model = Model(
-            model_config_path=GROUNDING_DINO_CONFIG_PATH,
-            model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH)
-
-        self.sam = sam_model_registry[SAM_ENCODER_VERSION](
-            checkpoint=SAM_CHECKPOINT_PATH)
-        self.sam.to(device=DEVICE)
-        self.sam_predictor = SamPredictor(self.sam)
-
-        self.cv_bridge = CvBridge()
-        self.annotate = annotate
-        self.n_frames_processed = 0
-        self._start = False
-        self._last_depth_msg = None
-
-    def start(self, _: Empty):
-        self._start = True
-
-    def depth_callback(self, msg):
-        self._last_depth_msg = msg
-
-    def image_callback(self, msg):
-        if not self._start or not self._last_depth_msg:
+    def start(self, _: String):
+        if not self._last_rgb_msg or not self._last_depth_msg:
             return
+        self._logger.info('Proecssing Prompt...')
 
-        self._logger.info('Handling image...')
-        image = self.cv_bridge.imgmsg_to_cv2(msg)
+        image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
 
         detections: sv.Detections = self.grounding_dino_model.predict_with_classes(
             image=image,
@@ -190,9 +187,15 @@ class GroundedSAMNode(Node):
         pc_msg = point_cloud(points, "/camera_color_frame")
         self.point_cloud_pub.publish(pc_msg)
 
+        detected_classes = [CLASSES[class_id] for class_id in detections.class_id]
+        self._logger.info(f'Detected {detected_classes}.')
         self.n_frames_processed += 1
-        self._start = False
 
+    def depth_callback(self, msg):
+        self._last_depth_msg = msg
+
+    def image_callback(self, msg):
+        self._last_rgb_msg = msg
 
 def main():
     rclpy.init()
