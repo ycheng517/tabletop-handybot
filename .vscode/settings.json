@@ -1,0 +1,10 @@
+{
+    "python.analysis.extraPaths": [
+        "/home/yifei/src/Grounded-Segment-Anything/GroundingDINO"
+      ],
+      "files.exclude": {
+        "build/": true,
+        "install/": true,
+        "log/": true
+      }
+}

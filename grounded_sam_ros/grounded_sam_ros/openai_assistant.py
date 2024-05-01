@@ -1,10 +1,10 @@
 from openai import OpenAI # pylint: disable=import-self
+from openai.types.beta import Assistant
 
 
 ASSISTANT_ID = "asst_WLqCkCKIerFYoaSCEvCmIJdR"
 
-def get_or_create_assistant():
-    client = OpenAI()
+def get_or_create_assistant(client: OpenAI) -> Assistant:
     if ASSISTANT_ID:
         return client.beta.assistants.retrieve(ASSISTANT_ID)
 
