@@ -1,6 +1,7 @@
 import json
 import os
 
+import cv2
 import numpy as np
 import open3d as o3d
 import openai
@@ -8,19 +9,18 @@ import rclpy
 import supervision as sv
 import torch
 import torchvision
-import cv2
 from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose, PoseStamped
 from groundingdino.util.inference import Model
 from openai.types.beta import Assistant
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from segment_anything import SamPredictor, sam_model_registry
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header, String
-from geometry_msgs.msg import Pose, PoseStamped
-from moveit.planning import MoveItPy
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.callback_groups import ReentrantCallbackGroup
-from pymoveit2 import GripperInterface
+
+from pymoveit2 import GripperInterface, MoveIt2
 
 from .openai_assistant import get_or_create_assistant
 
@@ -36,7 +36,6 @@ SAM_ENCODER_VERSION = "vit_h"
 SAM_CHECKPOINT_PATH = "/home/yifei/src/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
-CLASSES = ["toy . plate"]
 BOX_THRESHOLD = 0.25
 TEXT_THRESHOLD = 0.25
 NMS_THRESHOLD = 0.8
@@ -124,16 +123,29 @@ class GroundedSAMNode(Node):
         self.assistant: Assistant = get_or_create_assistant(self.openai)
 
         self.cv_bridge = CvBridge()
-        self.moveit = MoveItPy(node_name="moveit_py")
-        self.arm = self.moveit.get_planning_component("ar_manipulator")
         self.gripper_joint_name = "gripper_joint"
+        callback_group = ReentrantCallbackGroup()
+        # Create MoveIt 2 interface
+        self.moveit2 = MoveIt2(
+            node=self,
+            joint_names=[
+                "joint_1", "joint_2", "joint_3", "joint_4", "joint_5",
+                "joint_6"
+            ],
+            base_link_name="base_link",
+            end_effector_name="link_6",
+            group_name="ar_manipulator",
+            callback_group=callback_group,
+        )
+        self.moveit2.planner_id = "RRTConnectkConfigDefault"
+
         self.gripper_interface = GripperInterface(
             node=self,
             gripper_joint_names=["gripper_jaw1_joint"],
             open_gripper_joint_positions=[-0.012],
             closed_gripper_joint_positions=[0.0],
             gripper_group_name="ar_gripper",
-            callback_group=ReentrantCallbackGroup(),
+            callback_group=callback_group,
             gripper_command_action_name="/gripper_controller/gripper_cmd",
         )
 
@@ -157,6 +169,8 @@ class GroundedSAMNode(Node):
             String, "/save_images", self.save_images, 10)
         self.release_at_sub = self.create_subscription(Pose, "/release_at",
                                                        self.release_at, 10)
+
+        self.logger.info("Grounded SAM node initialized.")
 
     def start(self, msg: String):
         if not self._last_rgb_msg or not self._last_depth_msg:
@@ -197,10 +211,10 @@ class GroundedSAMNode(Node):
                 if tool_call.type == "function":
                     if tool_call.function.name == "get_objects":
                         args = json.loads(tool_call.function.arguments)
-                        detections = self.detect_objects(
-                            rgb_image, args["object_classes"])
+                        classes = args["object_classes"]
+                        detections = self.detect_objects(rgb_image, classes)
                         detected_classes = [
-                            CLASSES[class_id]
+                            classes[class_id]
                             for class_id in detections.class_id
                         ]
                         self.logger.info(f"Detected {detected_classes}.")
@@ -241,7 +255,7 @@ class GroundedSAMNode(Node):
                         tool_outputs=tool_outputs)
                     self.logger.info("Tool outputs submitted successfully.")
                 except Exception as e:  # pylint: disable=broad-except
-                    self.logger.error("Failed to submit tool outputs:", e)
+                    self.logger.error(f"Failed to submit tool outputs: {e}")
             else:
                 self.logger.info("No tool outputs to submit.")
 
@@ -274,7 +288,7 @@ class GroundedSAMNode(Node):
             box_annotator = sv.BoxAnnotator()
             mask_annotator = sv.MaskAnnotator()
             labels = [
-                f"{CLASSES[class_id]} {confidence:0.2f}"
+                f"{object_classes[class_id]} {confidence:0.2f}"
                 for _, _, confidence, class_id, _, _ in detections
             ]
             annotated_frame = box_annotator.annotate(scene=image.copy(),
@@ -353,17 +367,14 @@ class GroundedSAMNode(Node):
         pose_goal.header.frame_id = "base_link"
         pose_goal.pose = msg
 
-        # set plan start state to current state
-        self.arm.set_start_state_to_current_state()
-        # set pose goal with PoseStamped message
-        self.arm.set_goal_state(pose_stamped_msg=pose_goal, pose_link="link_6")
-        self._plan_and_execute()
+        self.moveit2.move_to_pose(pose=pose_goal)
+        self.moveit2.wait_until_executed()
 
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
 
-        self.gripper_interface.close()
-        self.gripper_interface.wait_until_executed()
+        # self.gripper_interface.close()
+        # self.gripper_interface.wait_until_executed()
 
     def depth_callback(self, msg):
         self._last_depth_msg = msg
@@ -377,8 +388,6 @@ class GroundedSAMNode(Node):
 
         rgb_image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
         depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
-        print(f"depth image dtype: {depth_image.dtype}")
-        print(f"depth image max min: {depth_image.max()}, {depth_image.min()}")
 
         save_dir = msg.data
         cv2.imwrite(
@@ -388,20 +397,6 @@ class GroundedSAMNode(Node):
             os.path.join(save_dir,
                          f"depth_image_{self.n_frames_processed}.npz"),
             depth_image)
-
-    def _plan_and_execute(self):
-        """Helper function to plan and execute a motion."""
-        # plan to goal
-        self.logger.info("Planning trajectory")
-        plan_result = self.arm.plan()
-
-        # execute the plan
-        if plan_result:
-            self.logger.info("Executing plan")
-            robot_trajectory = plan_result.trajectory
-            self.moveit.execute(robot_trajectory, controllers=[])
-        else:
-            self.logger.error("Planning failed")
 
 
 def main():
