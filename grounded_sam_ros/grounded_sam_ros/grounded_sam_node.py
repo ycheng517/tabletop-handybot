@@ -7,6 +7,7 @@ import open3d as o3d
 import openai
 import rclpy
 import supervision as sv
+import tf2_ros
 import torch
 import torchvision
 from cv_bridge import CvBridge
@@ -16,9 +17,12 @@ from openai.types.beta import Assistant
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
 from segment_anything import SamPredictor, sam_model_registry
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import Header, String
+from std_msgs.msg import Header, String, Int64
+from scipy.spatial.transform import Rotation
 
 from pymoveit2 import GripperInterface, MoveIt2
 
@@ -111,17 +115,6 @@ class GroundedSAMNode(Node):
 
         self.logger = self.get_logger()
 
-        self.grounding_dino_model = Model(
-            model_config_path=GROUNDING_DINO_CONFIG_PATH,
-            model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH,
-        )
-        self.sam = sam_model_registry[SAM_ENCODER_VERSION](
-            checkpoint=SAM_CHECKPOINT_PATH)
-        self.sam.to(device=DEVICE)
-        self.sam_predictor = SamPredictor(self.sam)
-        self.openai = openai.OpenAI()
-        self.assistant: Assistant = get_or_create_assistant(self.openai)
-
         self.cv_bridge = CvBridge()
         self.gripper_joint_name = "gripper_joint"
         callback_group = ReentrantCallbackGroup()
@@ -138,7 +131,6 @@ class GroundedSAMNode(Node):
             callback_group=callback_group,
         )
         self.moveit2.planner_id = "RRTConnectkConfigDefault"
-
         self.gripper_interface = GripperInterface(
             node=self,
             gripper_joint_names=["gripper_jaw1_joint"],
@@ -148,11 +140,25 @@ class GroundedSAMNode(Node):
             callback_group=callback_group,
             gripper_command_action_name="/gripper_controller/gripper_cmd",
         )
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.grounding_dino_model = Model(
+            model_config_path=GROUNDING_DINO_CONFIG_PATH,
+            model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH,
+        )
+        self.sam = sam_model_registry[SAM_ENCODER_VERSION](
+            checkpoint=SAM_CHECKPOINT_PATH)
+        self.sam.to(device=DEVICE)
+        self.sam_predictor = SamPredictor(self.sam)
+        self.openai = openai.OpenAI()
+        self.assistant: Assistant = get_or_create_assistant(self.openai)
 
         self.annotate = annotate
         self.n_frames_processed = 0
         self._last_depth_msg = None
         self._last_rgb_msg = None
+        self._last_detections: sv.Detections | None = None
 
         self.image_sub = self.create_subscription(Image,
                                                   "/camera/color/image_raw",
@@ -167,8 +173,11 @@ class GroundedSAMNode(Node):
                                                    self.start, 10)
         self.save_images_sub = self.create_subscription(
             String, "/save_images", self.save_images, 10)
-        self.release_at_sub = self.create_subscription(Pose, "/release_at",
-                                                       self.release_at, 10)
+        self.release_at_sub = self.create_subscription(Int64, "/release_above",
+                                                       self.release_above_cb,
+                                                       10)
+        self.detect_objects_sub = self.create_subscription(
+            String, "/detect_objects", self.detect_objects_cb, 10)
 
         self.logger.info("Grounded SAM node initialized.")
 
@@ -260,6 +269,7 @@ class GroundedSAMNode(Node):
                 self.logger.info("No tool outputs to submit.")
 
     def detect_objects(self, image: np.ndarray, object_classes: str):
+        self.logger.info(f"Detecting objects of classes: {object_classes}")
         detections: sv.Detections = self.grounding_dino_model.predict_with_classes(
             image=image,
             classes=[object_classes],
@@ -357,12 +367,63 @@ class GroundedSAMNode(Node):
 
         elif action == "move_above_object_and_release":
             # move the robot arm above the object and release the object
-            pass
+            cam_to_base_link_tf = self.tf_buffer.lookup_transform(
+                target_frame="base_link",
+                source_frame="camera_color_frame",
+                time=Time(),
+                timeout=Duration(seconds=5))
+            cam_to_base_rot = Rotation.from_quat([
+                cam_to_base_link_tf.transform.rotation.x,
+                cam_to_base_link_tf.transform.rotation.y,
+                cam_to_base_link_tf.transform.rotation.z,
+                cam_to_base_link_tf.transform.rotation.w,
+            ])
+            cam_to_base_pos = np.array([
+                cam_to_base_link_tf.transform.translation.x,
+                cam_to_base_link_tf.transform.translation.y,
+                cam_to_base_link_tf.transform.translation.z,
+            ])
+            cam_to_base_mat = np.eye(4)
+            cam_to_base_mat[:3, :3] = cam_to_base_rot.as_matrix()
+            cam_to_base_mat[:3, 3] = cam_to_base_pos
+
+            masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
+            mask = detections.mask[object_index]
+            masked_depth_image[mask] = depth_image[mask]
+            masked_depth_image /= 1000.0
+
+            # convert the masked depth image to a point cloud
+            pcd = o3d.geometry.PointCloud.create_from_depth_image(
+                o3d.geometry.Image(masked_depth_image),
+                o3d.camera.PinholeCameraIntrinsic(
+                    o3d.camera.PinholeCameraIntrinsicParameters.
+                    PrimeSenseDefault),
+            )
+            pcd.transform(cam_to_base_mat)
+
+            points = np.asarray(pcd.points).astype(np.float32)
+            grasp_z = points[:, 2].max() + 0.1  # release 10cm above the object
+            xy_points = points[:, :2]
+            xy_points = xy_points.astype(np.float32)
+            center, dimensions, theta = cv2.minAreaRect(xy_points)
+
+            drop_pose = Pose()
+            drop_pose.position.x = center[0]
+            drop_pose.position.y = center[1]
+            drop_pose.position.z = grasp_z
+            # Straight down pose
+            drop_pose.orientation.x = 0.0
+            drop_pose.orientation.y = 1.0
+            drop_pose.orientation.z = 0.0
+            drop_pose.orientation.w = 0.0
+
+            self.release_at(drop_pose)
         return True
 
     def release_at(self, msg: Pose):
         # NOTE: straight down is wxyz 0, 0, 1, 0
         # good pose is 0, -0.3, 0.35
+        self.logger.info(f"Releasing at: {msg}")
         pose_goal = PoseStamped()
         pose_goal.header.frame_id = "base_link"
         pose_goal.pose = msg
@@ -373,8 +434,22 @@ class GroundedSAMNode(Node):
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
 
-        # self.gripper_interface.close()
-        # self.gripper_interface.wait_until_executed()
+    def detect_objects_cb(self, msg: String):
+        if self._last_rgb_msg is None:
+            self.logger.warning("No RGB image available.")
+            return
+
+        rgb_image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
+        self._last_detections = self.detect_objects(rgb_image, msg.data)
+
+    def release_above_cb(self, msg: Int64):
+        if self._last_detections is None or self._last_depth_msg is None:
+            self.logger.warning("No detections or depth image available.")
+            return
+
+        depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
+        self.execute_action("move_above_object_and_release", msg.data,
+                            self._last_detections, depth_image)
 
     def depth_callback(self, msg):
         self._last_depth_msg = msg
@@ -394,8 +469,7 @@ class GroundedSAMNode(Node):
             os.path.join(save_dir, f"rgb_image_{self.n_frames_processed}.png"),
             rgb_image)
         np.save(
-            os.path.join(save_dir,
-                         f"depth_image_{self.n_frames_processed}.npz"),
+            os.path.join(save_dir, f"depth_image_{self.n_frames_processed}"),
             depth_image)
 
 

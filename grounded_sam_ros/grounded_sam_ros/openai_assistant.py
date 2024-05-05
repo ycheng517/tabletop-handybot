@@ -62,5 +62,5 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
                 },
             },
         ],
-        model="gpt-3.5-turbo",
+        model="gpt-4-turbo",
     )
