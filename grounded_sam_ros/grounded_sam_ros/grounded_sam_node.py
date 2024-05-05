@@ -1,5 +1,6 @@
 import json
 import os
+from functools import cached_property
 
 import cv2
 import numpy as np
@@ -173,11 +174,13 @@ class GroundedSAMNode(Node):
                                                    self.start, 10)
         self.save_images_sub = self.create_subscription(
             String, "/save_images", self.save_images, 10)
+        self.detect_objects_sub = self.create_subscription(
+            String, "/detect_objects", self.detect_objects_cb, 10)
         self.release_at_sub = self.create_subscription(Int64, "/release_above",
                                                        self.release_above_cb,
                                                        10)
-        self.detect_objects_sub = self.create_subscription(
-            String, "/detect_objects", self.detect_objects_cb, 10)
+        self.pick_object_sub = self.create_subscription(
+            Int64, "/pick_object", self.pick_object_cb, 10)
 
         self.logger.info("Grounded SAM node initialized.")
 
@@ -222,6 +225,7 @@ class GroundedSAMNode(Node):
                         args = json.loads(tool_call.function.arguments)
                         classes = args["object_classes"]
                         detections = self.detect_objects(rgb_image, classes)
+                        # TODO: this isn't correct
                         detected_classes = [
                             classes[class_id]
                             for class_id in detections.class_id
@@ -243,8 +247,7 @@ class GroundedSAMNode(Node):
                             self.logger.error(
                                 "No detections available to execute action.")
                             continue
-
-                        result = self.execute_action(
+                        self.execute_action(
                             args["action"],
                             args["object_index"],
                             detections,
@@ -252,7 +255,7 @@ class GroundedSAMNode(Node):
                         )
                         tool_outputs.append({
                             "type": "action_result",
-                            "success": result,
+                            "success": True,
                         })
             self.logger.info(f"tool_outputs: {tool_outputs}")
 
@@ -338,87 +341,134 @@ class GroundedSAMNode(Node):
         object_index: int,
         detections: sv.Detections,
         depth_image: np.ndarray,
-    ) -> bool:
+    ) -> None:
         if action == "pick_object":
-            # pick the object top down
-            # mask out the depth image except for the detected objects
-            masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
-            mask = detections.mask[object_index]
-            masked_depth_image[mask] = depth_image[mask]
-            masked_depth_image /= 1000.0
-
-            # convert the masked depth image to a point cloud
-            pcd = o3d.geometry.PointCloud.create_from_depth_image(
-                o3d.geometry.Image(masked_depth_image),
-                o3d.camera.PinholeCameraIntrinsic(
-                    o3d.camera.PinholeCameraIntrinsicParameters.
-                    PrimeSenseDefault),
-            )
-            # TODO(Yifei): transform point cloud to robot base frame
-            points = np.asarray(pcd.points)
-
-            min_z = points[:, 2].min()
-            grasp_z = min_z + (points[:, 2].max() - min_z) / 2
-            # get minAreaRect of the object in top-down view
-            center, dimensions, theta = cv2.minAreaRect(points[:, :2])
-            print(center)
-            print(dimensions)
-            print(theta)
-
+            self.pick_object(object_index, detections, depth_image)
         elif action == "move_above_object_and_release":
-            # move the robot arm above the object and release the object
-            cam_to_base_link_tf = self.tf_buffer.lookup_transform(
-                target_frame="base_link",
-                source_frame="camera_color_frame",
-                time=Time(),
-                timeout=Duration(seconds=5))
-            cam_to_base_rot = Rotation.from_quat([
-                cam_to_base_link_tf.transform.rotation.x,
-                cam_to_base_link_tf.transform.rotation.y,
-                cam_to_base_link_tf.transform.rotation.z,
-                cam_to_base_link_tf.transform.rotation.w,
-            ])
-            cam_to_base_pos = np.array([
-                cam_to_base_link_tf.transform.translation.x,
-                cam_to_base_link_tf.transform.translation.y,
-                cam_to_base_link_tf.transform.translation.z,
-            ])
-            cam_to_base_mat = np.eye(4)
-            cam_to_base_mat[:3, :3] = cam_to_base_rot.as_matrix()
-            cam_to_base_mat[:3, 3] = cam_to_base_pos
+            self.release_above(object_index, detections, depth_image)
+        else:
+            self.logger.error(f"Unknown action: {action}")
 
-            masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
-            mask = detections.mask[object_index]
-            masked_depth_image[mask] = depth_image[mask]
-            masked_depth_image /= 1000.0
+    def pick_object(self, object_index: int, detections: sv.Detections,
+                    depth_image: np.ndarray):
+        """Perform a top-down grasp on the object."""
+        # mask out the depth image except for the detected objects
+        masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
+        mask = detections.mask[object_index]
+        masked_depth_image[mask] = depth_image[mask]
+        masked_depth_image /= 1000.0
 
-            # convert the masked depth image to a point cloud
-            pcd = o3d.geometry.PointCloud.create_from_depth_image(
-                o3d.geometry.Image(masked_depth_image),
-                o3d.camera.PinholeCameraIntrinsic(
-                    o3d.camera.PinholeCameraIntrinsicParameters.
-                    PrimeSenseDefault),
-            )
-            pcd.transform(cam_to_base_mat)
+        # convert the masked depth image to a point cloud
+        pcd = o3d.geometry.PointCloud.create_from_depth_image(
+            o3d.geometry.Image(masked_depth_image),
+            o3d.camera.PinholeCameraIntrinsic(
+                o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault),
+        )
+        pcd.transform(self.cam_to_base_affine)
+        points = np.asarray(pcd.points)
 
-            points = np.asarray(pcd.points).astype(np.float32)
-            grasp_z = points[:, 2].max() + 0.1  # release 10cm above the object
-            xy_points = points[:, :2]
-            xy_points = xy_points.astype(np.float32)
-            center, dimensions, theta = cv2.minAreaRect(xy_points)
+        xy_points = points[:, :2]
+        xy_points = xy_points.astype(np.float32)
+        center, dimensions, theta = cv2.minAreaRect(xy_points)
 
-            drop_pose = Pose()
-            drop_pose.position.x = center[0]
-            drop_pose.position.y = center[1]
-            drop_pose.position.z = grasp_z
-            # Straight down pose
-            drop_pose.orientation.x = 0.0
-            drop_pose.orientation.y = 1.0
-            drop_pose.orientation.z = 0.0
-            drop_pose.orientation.w = 0.0
+        gripper_rotation = theta
+        if dimensions[0] > dimensions[1]:
+            gripper_rotation -= 90
+        if gripper_rotation < -90:
+            gripper_rotation += 180
+        elif gripper_rotation > 90:
+            gripper_rotation -= 180
 
-            self.release_at(drop_pose)
-        return True
+        grasp_z = points[:, 2].max()
+        gripper_opening = min(dimensions)
+        grasp_pose = Pose()
+        grasp_pose.position.x = center[0]
+        grasp_pose.position.y = center[1]
+        grasp_pose.position.z = grasp_z
+        top_down_rot = Rotation.from_quat([0, 1, 0, 0])
+        extra_rot = Rotation.from_euler("z", gripper_rotation, degrees=True)
+        grasp_quat = (extra_rot * top_down_rot).as_quat()
+        grasp_pose.orientation.x = grasp_quat[0]
+        grasp_pose.orientation.y = grasp_quat[1]
+        grasp_pose.orientation.z = grasp_quat[2]
+        grasp_pose.orientation.w = grasp_quat[3]
+        self.grasp_at(grasp_pose, gripper_opening)
+
+    def grasp_at(self, msg: Pose, gripper_opening: float):
+        self.logger.info(f"Releasing at: {msg}")
+
+        self.gripper_interface.open()
+        self.gripper_interface.wait_until_executed()
+
+        pose_goal = PoseStamped()
+        pose_goal.header.frame_id = "base_link"
+        pose_goal.pose = msg
+
+        self.moveit2.move_to_pose(pose=pose_goal)
+        self.moveit2.wait_until_executed()
+
+        gripper_pos = -gripper_opening / 2
+        gripper_pos = max(gripper_pos, -0.012)
+        self.gripper_interface.move_to_position(gripper_pos)
+        self.gripper_interface.wait_until_executed()
+
+    def release_above(self, object_index: int, detections: sv.Detections,
+                      depth_image: np.ndarray):
+        """Move the robot arm above the object and release the gripper."""
+        masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
+        mask = detections.mask[object_index]
+        masked_depth_image[mask] = depth_image[mask]
+        masked_depth_image /= 1000.0
+
+        # convert the masked depth image to a point cloud
+        pcd = o3d.geometry.PointCloud.create_from_depth_image(
+            o3d.geometry.Image(masked_depth_image),
+            o3d.camera.PinholeCameraIntrinsic(
+                o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault),
+        )
+        pcd.transform(self.cam_to_base_affine)
+
+        points = np.asarray(pcd.points).astype(np.float32)
+        grasp_z = points[:, 2].max() + 0.1  # release 10cm above the object
+
+        xy_points = points[:, :2]
+        xy_points = xy_points.astype(np.float32)
+        center, _, _ = cv2.minAreaRect(xy_points)
+
+        drop_pose = Pose()
+        drop_pose.position.x = center[0]
+        drop_pose.position.y = center[1]
+        drop_pose.position.z = grasp_z
+        # Straight down pose
+        drop_pose.orientation.x = 0.0
+        drop_pose.orientation.y = 1.0
+        drop_pose.orientation.z = 0.0
+        drop_pose.orientation.w = 0.0
+
+        self.release_at(drop_pose)
+
+    @cached_property
+    def cam_to_base_affine(self):
+        cam_to_base_link_tf = self.tf_buffer.lookup_transform(
+            target_frame="base_link",
+            source_frame="camera_color_frame",
+            time=Time(),
+            timeout=Duration(seconds=5))
+        cam_to_base_rot = Rotation.from_quat([
+            cam_to_base_link_tf.transform.rotation.x,
+            cam_to_base_link_tf.transform.rotation.y,
+            cam_to_base_link_tf.transform.rotation.z,
+            cam_to_base_link_tf.transform.rotation.w,
+        ])
+        cam_to_base_pos = np.array([
+            cam_to_base_link_tf.transform.translation.x,
+            cam_to_base_link_tf.transform.translation.y,
+            cam_to_base_link_tf.transform.translation.z,
+        ])
+        affine = np.eye(4)
+        affine[:3, :3] = cam_to_base_rot.as_matrix()
+        affine[:3, 3] = cam_to_base_pos
+        return affine
 
     def release_at(self, msg: Pose):
         # NOTE: straight down is wxyz 0, 0, 1, 0
@@ -441,6 +491,20 @@ class GroundedSAMNode(Node):
 
         rgb_image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
         self._last_detections = self.detect_objects(rgb_image, msg.data)
+        class_names = [c.replace(" ", "") for c in msg.data.split(".")]
+        detected_classes = [
+            class_names[class_id]
+            for class_id in self._last_detections.class_id
+        ]
+        self.logger.info(f"Detected objects: {detected_classes}")
+
+    def pick_object_cb(self, msg: Int64):
+        if self._last_detections is None or self._last_depth_msg is None:
+            self.logger.warning("No detections or depth image available.")
+            return
+
+        depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
+        self.pick_object(msg.data, self._last_detections, depth_image)
 
     def release_above_cb(self, msg: Int64):
         if self._last_detections is None or self._last_depth_msg is None:
@@ -448,8 +512,7 @@ class GroundedSAMNode(Node):
             return
 
         depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
-        self.execute_action("move_above_object_and_release", msg.data,
-                            self._last_detections, depth_image)
+        self.release_above(msg.data, self._last_detections, depth_image)
 
     def depth_callback(self, msg):
         self._last_depth_msg = msg
