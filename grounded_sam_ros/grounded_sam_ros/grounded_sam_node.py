@@ -160,6 +160,9 @@ class GroundedSAMNode(Node):
         self._last_depth_msg = None
         self._last_rgb_msg = None
         self._last_detections: sv.Detections | None = None
+        self._x_offset = 0.0
+        self._y_offset = -0.02
+        self._z_offset = 0.09  # accounts for the height of the gripper plus tolerance
 
         self.image_sub = self.create_subscription(Image,
                                                   "/camera/color/image_raw",
@@ -366,8 +369,10 @@ class GroundedSAMNode(Node):
         )
         pcd.transform(self.cam_to_base_affine)
         points = np.asarray(pcd.points)
+        grasp_z = points[:, 2].max()
 
-        xy_points = points[:, :2]
+        near_grasp_z_points = points[points[:, 2] > grasp_z - 0.02]
+        xy_points = near_grasp_z_points[:, :2]
         xy_points = xy_points.astype(np.float32)
         center, dimensions, theta = cv2.minAreaRect(xy_points)
 
@@ -379,12 +384,11 @@ class GroundedSAMNode(Node):
         elif gripper_rotation > 90:
             gripper_rotation -= 180
 
-        grasp_z = points[:, 2].max()
         gripper_opening = min(dimensions)
         grasp_pose = Pose()
-        grasp_pose.position.x = center[0]
-        grasp_pose.position.y = center[1]
-        grasp_pose.position.z = grasp_z
+        grasp_pose.position.x = center[0] + self._x_offset
+        grasp_pose.position.y = center[1] + self._y_offset
+        grasp_pose.position.z = grasp_z + self._z_offset
         top_down_rot = Rotation.from_quat([0, 1, 0, 0])
         extra_rot = Rotation.from_euler("z", gripper_rotation, degrees=True)
         grasp_quat = (extra_rot * top_down_rot).as_quat()
@@ -395,7 +399,7 @@ class GroundedSAMNode(Node):
         self.grasp_at(grasp_pose, gripper_opening)
 
     def grasp_at(self, msg: Pose, gripper_opening: float):
-        self.logger.info(f"Releasing at: {msg}")
+        self.logger.info(f"Grasp at: {msg} with opening: {gripper_opening}")
 
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
@@ -407,7 +411,7 @@ class GroundedSAMNode(Node):
         self.moveit2.move_to_pose(pose=pose_goal)
         self.moveit2.wait_until_executed()
 
-        gripper_pos = -gripper_opening / 2
+        gripper_pos = -gripper_opening / 2.0
         gripper_pos = max(gripper_pos, -0.012)
         self.gripper_interface.move_to_position(gripper_pos)
         self.gripper_interface.wait_until_executed()
@@ -429,16 +433,17 @@ class GroundedSAMNode(Node):
         pcd.transform(self.cam_to_base_affine)
 
         points = np.asarray(pcd.points).astype(np.float32)
-        grasp_z = points[:, 2].max() + 0.1  # release 10cm above the object
+        # release 10cm above the object
+        grasp_z = points[:, 2].max() + 0.1
 
         xy_points = points[:, :2]
         xy_points = xy_points.astype(np.float32)
         center, _, _ = cv2.minAreaRect(xy_points)
 
         drop_pose = Pose()
-        drop_pose.position.x = center[0]
-        drop_pose.position.y = center[1]
-        drop_pose.position.z = grasp_z
+        drop_pose.position.x = center[0] + self._x_offset
+        drop_pose.position.y = center[1] + self._y_offset
+        drop_pose.position.z = grasp_z + self._z_offset
         # Straight down pose
         drop_pose.orientation.x = 0.0
         drop_pose.orientation.y = 1.0
