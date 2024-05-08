@@ -1,6 +1,7 @@
 import json
 import os
 from functools import cached_property
+from typing import List
 
 import cv2
 import numpy as np
@@ -160,7 +161,7 @@ class GroundedSAMNode(Node):
         self._last_depth_msg = None
         self._last_rgb_msg = None
         self._last_detections: sv.Detections | None = None
-        self._x_offset = 0.0
+        self._x_offset = -0.025
         self._y_offset = -0.02
         self._z_offset = 0.09  # accounts for the height of the gripper plus tolerance
 
@@ -201,7 +202,7 @@ class GroundedSAMNode(Node):
             role="user",
             content=msg.data,
         )
-        self.logger.info(message)
+        print(message)
 
         run = self.openai.beta.threads.runs.create_and_poll(
             thread_id=thread.id,
@@ -226,9 +227,9 @@ class GroundedSAMNode(Node):
                 if tool_call.type == "function":
                     if tool_call.function.name == "get_objects":
                         args = json.loads(tool_call.function.arguments)
-                        classes = args["object_classes"]
+                        classes_str = args["object_classes"]
+                        classes = classes_str.split(",")
                         detections = self.detect_objects(rgb_image, classes)
-                        # TODO: this isn't correct
                         detected_classes = [
                             classes[class_id]
                             for class_id in detections.class_id
@@ -274,11 +275,11 @@ class GroundedSAMNode(Node):
             else:
                 self.logger.info("No tool outputs to submit.")
 
-    def detect_objects(self, image: np.ndarray, object_classes: str):
+    def detect_objects(self, image: np.ndarray, object_classes: List[str]):
         self.logger.info(f"Detecting objects of classes: {object_classes}")
         detections: sv.Detections = self.grounding_dino_model.predict_with_classes(
             image=image,
-            classes=[object_classes],
+            classes=object_classes,
             box_threshold=BOX_THRESHOLD,
             text_threshold=TEXT_THRESHOLD,
         )
@@ -371,7 +372,7 @@ class GroundedSAMNode(Node):
         points = np.asarray(pcd.points)
         grasp_z = points[:, 2].max()
 
-        near_grasp_z_points = points[points[:, 2] > grasp_z - 0.02]
+        near_grasp_z_points = points[points[:, 2] > grasp_z - 0.01]
         xy_points = near_grasp_z_points[:, :2]
         xy_points = xy_points.astype(np.float32)
         center, dimensions, theta = cv2.minAreaRect(xy_points)
@@ -494,9 +495,9 @@ class GroundedSAMNode(Node):
             self.logger.warning("No RGB image available.")
             return
 
+        class_names = msg.data.split(",")
         rgb_image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
-        self._last_detections = self.detect_objects(rgb_image, msg.data)
-        class_names = [c.replace(" ", "") for c in msg.data.split(".")]
+        self._last_detections = self.detect_objects(rgb_image, class_names)
         detected_classes = [
             class_names[class_id]
             for class_id in self._last_detections.class_id

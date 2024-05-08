@@ -1,7 +1,6 @@
 from openai import OpenAI  # pylint: disable=import-self
 from openai.types.beta import Assistant
 
-
 ASSISTANT_ID = "asst_WLqCkCKIerFYoaSCEvCmIJdR"
 
 
@@ -20,16 +19,17 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
                 "type": "function",
                 "function": {
                     "name": "get_objects",
-                    "description": "Detect objects in the field of view of the camera",
+                    "description":
+                    "Detect objects in the field of view of the camera",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "object_classes": {
-                                "type": "string",
+                                "type":
+                                "string",
                                 "description": (
-                                    "Object classes to detect, space ",
-                                    "and dot separated. For example: ",
-                                    "horses . rivers . plain",
+                                    "Object classes to detect, comma separated",
+                                    "For example: horses,rivers,plain",
                                 ),
                             }
                         },
@@ -46,15 +46,18 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
                         "type": "object",
                         "properties": {
                             "action": {
-                                "type": "string",
+                                "type":
+                                "string",
                                 "enum": [
                                     "pick_object",
                                     "move_above_object_and_release",
                                 ],
                             },
                             "object_index": {
-                                "type": "int",
-                                "description": "index of the object in the list of detected objects to execute the action for.",
+                                "type":
+                                "int",
+                                "description":
+                                "index of the object in the list of detected objects to execute the action for.",
                             },
                         },
                         "required": ["action", "object"],
