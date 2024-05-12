@@ -2,6 +2,9 @@
 install/
 log/
 
+# imported repositories
+pymoveit2/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

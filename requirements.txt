@@ -1,0 +1,3 @@
+open3d
+whisper-mic
+openai
