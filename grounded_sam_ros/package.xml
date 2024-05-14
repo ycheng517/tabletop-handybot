@@ -9,8 +9,17 @@
   <maintainer email="ycheng517@gmail.com">Yifei Cheng</maintainer>
   <author email="ycheng517@gmail.com">Yifei Cheng</author>
 
+  <exec_depend>ar_hardware_interface</exec_depend>
+  <exec_depend>ar_moveit_config</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>easy_handeye2</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>realsense2_camera_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
 
   <!-- These test dependencies are optional
   Their purpose is to make sure that the code passes the linters -->
