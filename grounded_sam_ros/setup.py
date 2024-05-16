@@ -8,7 +8,7 @@ setup(
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
+         ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
@@ -30,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'grounded_sam_node = grounded_sam_ros.grounded_sam_node:main',
+            'audio_prompt_node = grounded_sam_ros.audio_prompt_node:main',
         ],
     },
 )

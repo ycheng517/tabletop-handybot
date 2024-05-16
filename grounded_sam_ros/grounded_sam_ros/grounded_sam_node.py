@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from functools import cached_property
 from typing import List
 
@@ -23,9 +24,8 @@ from rclpy.time import Time
 from rclpy.duration import Duration
 from segment_anything import SamPredictor, sam_model_registry
 from sensor_msgs.msg import Image, PointCloud2
-from std_msgs.msg import String, Int64, Empty
+from std_msgs.msg import String, Int64
 from scipy.spatial.transform import Rotation
-from whisper_mic import WhisperMic
 
 from pymoveit2 import GripperInterface, MoveIt2
 
@@ -64,7 +64,8 @@ def segment(sam_predictor: SamPredictor, image: np.ndarray,
 
 class GroundedSAMNode(Node):
 
-    def __init__(self, annotate: bool = False):
+    def __init__(self,
+                 annotate: bool = False):  # TODO: make annotate a rosparam
         super().__init__("grounded_sam_node")
 
         self.logger = self.get_logger()
@@ -107,16 +108,16 @@ class GroundedSAMNode(Node):
         self.sam_predictor = SamPredictor(self.sam)
         self.openai = openai.OpenAI()
         self.assistant: Assistant = get_or_create_assistant(self.openai)
-        self.whisper_mic = WhisperMic()
 
         self.annotate = annotate
         self.n_frames_processed = 0
         self._last_depth_msg = None
         self._last_rgb_msg = None
         self._last_detections: sv.Detections | None = None
-        self._x_offset = -0.025
-        self._y_offset = -0.02
-        self._z_offset = 0.09  # accounts for the height of the gripper plus tolerance
+        self.gripper_squeeze_factor = 0.5
+        self._x_offset = 0.005
+        self._y_offset = 0
+        self._z_offset = 0.08  # accounts for the height of the gripper
 
         self.image_sub = self.create_subscription(Image,
                                                   "/camera/color/image_raw",
@@ -129,8 +130,6 @@ class GroundedSAMNode(Node):
             PointCloud2, "/grounded_sam/point_cloud", 2)
         self.prompt_sub = self.create_subscription(String, "/prompt",
                                                    self.start, 10)
-        self.listen_sub = self.create_subscription(Empty, "/listen",
-                                                   self.listen, 10)
         self.save_images_sub = self.create_subscription(
             String, "/save_images", self.save_images, 10)
         self.detect_objects_sub = self.create_subscription(
@@ -142,10 +141,6 @@ class GroundedSAMNode(Node):
             Int64, "/pick_object", self.pick_object_cb, 10)
 
         self.logger.info("Grounded SAM node initialized.")
-
-    def listen(self, _: Empty):
-        result = self.whisper_mic.listen()
-        self.start(String(data=result))
 
     def start(self, msg: String):
         if not self._last_rgb_msg or not self._last_depth_msg:
@@ -169,17 +164,17 @@ class GroundedSAMNode(Node):
         )
 
         done = False
+        detections = None
         while not done:
             if run.status == "completed":
                 messages = self.openai.beta.threads.messages.list(
                     thread_id=thread.id)
-                self.logger.info(messages)
+                print(messages)
                 done = True
                 break
             else:
                 self.logger.info(run.status)
 
-            detections = None
             tool_outputs = []
             for tool_call in run.required_action.submit_tool_outputs.tool_calls:
                 self.logger.info(f"tool_call: {tool_call}")
@@ -194,21 +189,28 @@ class GroundedSAMNode(Node):
                             for class_id in detections.class_id
                         ]
                         self.logger.info(f"Detected {detected_classes}.")
+                        output_dict = {
+                            "object_classes": detected_classes,
+                        }
                         tool_outputs.append({
-                            "type":
-                            "object_detection_result",
-                            "object_classes":
-                            detected_classes,
-                            "confidence":
-                            detections.confidence.tolist(),
-                            "xyxy":
-                            detections.xyxy.tolist(),
+                            "tool_call_id": tool_call.id,
+                            "output": json.dumps(output_dict),
                         })
                     elif tool_call.function.name == "execute_action":
                         args = json.loads(tool_call.function.arguments)
                         if detections is None:
                             self.logger.error(
                                 "No detections available to execute action.")
+                            output_dict = {
+                                "success": False,
+                                "failure_reason": "No detections available.",
+                            }
+                            tool_outputs.append({
+                                "tool_call_id":
+                                tool_call.id,
+                                "output":
+                                json.dumps(output_dict),
+                            })
                             continue
                         self.execute_action(
                             args["action"],
@@ -216,9 +218,12 @@ class GroundedSAMNode(Node):
                             detections,
                             depth_image,
                         )
-                        tool_outputs.append({
-                            "type": "action_result",
+                        output_dict = {
                             "success": True,
+                        }
+                        tool_outputs.append({
+                            "tool_call_id": tool_call.id,
+                            "output": json.dumps(output_dict),
                         })
             self.logger.info(f"tool_outputs: {tool_outputs}")
 
@@ -270,10 +275,13 @@ class GroundedSAMNode(Node):
             annotated_frame = box_annotator.annotate(scene=image.copy(),
                                                      detections=detections,
                                                      labels=labels)
+            cv2.imwrite(
+                f"annotated_image_detections_{self.n_frames_processed}.jpg",
+                annotated_frame)
 
             annotated_frame = mask_annotator.annotate(scene=image.copy(),
                                                       detections=detections)
-            cv2.imwrite(f"annotated_image_{self.n_frames_processed}.jpg",
+            cv2.imwrite(f"annotated_image_masks_{self.n_frames_processed}.jpg",
                         annotated_frame)
 
         depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
@@ -331,7 +339,7 @@ class GroundedSAMNode(Node):
         points = np.asarray(pcd.points)
         grasp_z = points[:, 2].max()
 
-        near_grasp_z_points = points[points[:, 2] > grasp_z - 0.01]
+        near_grasp_z_points = points[points[:, 2] > grasp_z - 0.008]
         xy_points = near_grasp_z_points[:, :2]
         xy_points = xy_points.astype(np.float32)
         center, dimensions, theta = cv2.minAreaRect(xy_points)
@@ -364,17 +372,25 @@ class GroundedSAMNode(Node):
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
 
-        pose_goal = PoseStamped()
-        pose_goal.header.frame_id = "base_link"
-        pose_goal.pose = msg
+        # move 5cm above the item first
+        msg.position.z += 0.05
+        self.move_to(msg)
+        time.sleep(0.05)
 
-        self.moveit2.move_to_pose(pose=pose_goal)
-        self.moveit2.wait_until_executed()
+        # grasp the item
+        msg.position.z -= 0.05
+        self.move_to(msg)
+        time.sleep(0.05)
 
-        gripper_pos = -gripper_opening / 2.0
-        gripper_pos = max(gripper_pos, -0.012)
+        gripper_pos = -gripper_opening / 2. * self.gripper_squeeze_factor
+        gripper_pos = min(gripper_pos, 0.0)
         self.gripper_interface.move_to_position(gripper_pos)
         self.gripper_interface.wait_until_executed()
+
+        # lift the item
+        msg.position.z += 0.05
+        self.move_to(msg)
+        time.sleep(0.05)
 
     def release_above(self, object_index: int, detections: sv.Detections,
                       depth_image: np.ndarray):
@@ -393,17 +409,18 @@ class GroundedSAMNode(Node):
         pcd.transform(self.cam_to_base_affine)
 
         points = np.asarray(pcd.points).astype(np.float32)
-        # release 10cm above the object
-        grasp_z = points[:, 2].max() + 0.1
+        # release 5cm above the object
+        drop_z = np.percentile(points[:, 2], 95) + 0.05
+        median_z = np.median(points[:, 2])
 
-        xy_points = points[:, :2]
+        xy_points = points[points[:, 2] > median_z, :2]
         xy_points = xy_points.astype(np.float32)
         center, _, _ = cv2.minAreaRect(xy_points)
 
         drop_pose = Pose()
         drop_pose.position.x = center[0] + self._x_offset
         drop_pose.position.y = center[1] + self._y_offset
-        drop_pose.position.z = grasp_z + self._z_offset
+        drop_pose.position.z = drop_z + self._z_offset
         # Straight down pose
         drop_pose.orientation.x = 0.0
         drop_pose.orientation.y = 1.0
@@ -435,16 +452,19 @@ class GroundedSAMNode(Node):
         affine[:3, 3] = cam_to_base_pos
         return affine
 
-    def release_at(self, msg: Pose):
-        # NOTE: straight down is wxyz 0, 0, 1, 0
-        # good pose is 0, -0.3, 0.35
-        self.logger.info(f"Releasing at: {msg}")
+    def move_to(self, msg: Pose):
         pose_goal = PoseStamped()
         pose_goal.header.frame_id = "base_link"
         pose_goal.pose = msg
 
         self.moveit2.move_to_pose(pose=pose_goal)
         self.moveit2.wait_until_executed()
+
+    def release_at(self, msg: Pose):
+        # NOTE: straight down is wxyz 0, 0, 1, 0
+        # good pose is 0, -0.3, 0.35
+        self.logger.info(f"Releasing at: {msg}")
+        self.move_to(msg)
 
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
