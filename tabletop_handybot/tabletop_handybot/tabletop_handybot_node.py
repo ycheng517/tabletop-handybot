@@ -18,14 +18,14 @@ from geometry_msgs.msg import Pose, PoseStamped
 from groundingdino.util.inference import Model
 from openai.types.beta import Assistant
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
-from rclpy.duration import Duration
+from scipy.spatial.transform import Rotation
 from segment_anything import SamPredictor, sam_model_registry
 from sensor_msgs.msg import Image, PointCloud2
-from std_msgs.msg import String, Int64
-from scipy.spatial.transform import Rotation
+from std_msgs.msg import Int64, String
 
 from pymoveit2 import GripperInterface, MoveIt2
 
@@ -35,13 +35,13 @@ from .point_cloud_conversion import point_cloud_to_msg
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # GroundingDINO config and checkpoint
-GROUNDING_DINO_CONFIG_PATH = "/home/yifei/src/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+GROUNDING_DINO_CONFIG_PATH = "./Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CHECKPOINT_PATH = (
-    "/home/yifei/src/Grounded-Segment-Anything/groundingdino_swint_ogc.pth")
+    "./Grounded-Segment-Anything/groundingdino_swint_ogc.pth")
 
 # Segment-Anything checkpoint
 SAM_ENCODER_VERSION = "vit_h"
-SAM_CHECKPOINT_PATH = "/home/yifei/src/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
+SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
 BOX_THRESHOLD = 0.25
@@ -64,9 +64,11 @@ def segment(sam_predictor: SamPredictor, image: np.ndarray,
 
 class GroundedSAMNode(Node):
 
-    def __init__(self,
-                 annotate: bool = False):  # TODO: make annotate a rosparam
-        super().__init__("grounded_sam_node")
+    def __init__(
+            self,
+            annotate: bool = False,
+            publish_point_cloud: bool = False):  # TODO: make args rosparams
+        super().__init__("tabletop_handybot_node")
 
         self.logger = self.get_logger()
 
@@ -110,6 +112,7 @@ class GroundedSAMNode(Node):
         self.assistant: Assistant = get_or_create_assistant(self.openai)
 
         self.annotate = annotate
+        self.publish_point_cloud = publish_point_cloud
         self.n_frames_processed = 0
         self._last_depth_msg = None
         self._last_rgb_msg = None
@@ -126,8 +129,9 @@ class GroundedSAMNode(Node):
             Image, "/camera/aligned_depth_to_color/image_raw",
             self.depth_callback, 10)
 
-        self.point_cloud_pub = self.create_publisher(
-            PointCloud2, "/grounded_sam/point_cloud", 2)
+        if self.publish_point_cloud:
+            self.point_cloud_pub = self.create_publisher(
+                PointCloud2, "/point_cloud", 2)
         self.prompt_sub = self.create_subscription(String, "/prompt",
                                                    self.start, 10)
         self.save_images_sub = self.create_subscription(
@@ -284,24 +288,26 @@ class GroundedSAMNode(Node):
             cv2.imwrite(f"annotated_image_masks_{self.n_frames_processed}.jpg",
                         annotated_frame)
 
-        depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
-        # mask out the depth image except for the detected objects
-        masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
-        for mask in detections.mask:
-            masked_depth_image[mask] = depth_image[mask]
-        masked_depth_image /= 1000.0
+        if self.publish_point_cloud:
+            depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
+            # mask out the depth image except for the detected objects
+            masked_depth_image = np.zeros_like(depth_image, dtype=np.float32)
+            for mask in detections.mask:
+                masked_depth_image[mask] = depth_image[mask]
+            masked_depth_image /= 1000.0
 
-        # convert the masked depth image to a point cloud
-        pcd = o3d.geometry.PointCloud.create_from_depth_image(
-            o3d.geometry.Image(masked_depth_image),
-            o3d.camera.PinholeCameraIntrinsic(
-                o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault),
-        )
+            # convert the masked depth image to a point cloud
+            pcd = o3d.geometry.PointCloud.create_from_depth_image(
+                o3d.geometry.Image(masked_depth_image),
+                o3d.camera.PinholeCameraIntrinsic(
+                    o3d.camera.PinholeCameraIntrinsicParameters.
+                    PrimeSenseDefault),
+            )
 
-        # convert it to a ROS PointCloud2 message
-        points = np.asarray(pcd.points)
-        pc_msg = point_cloud_to_msg(points, "/camera_color_frame")
-        self.point_cloud_pub.publish(pc_msg)
+            # convert it to a ROS PointCloud2 message
+            points = np.asarray(pcd.points)
+            pc_msg = point_cloud_to_msg(points, "/camera_color_frame")
+            self.point_cloud_pub.publish(pc_msg)
 
         self.n_frames_processed += 1
         return detections

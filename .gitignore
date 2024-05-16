@@ -4,6 +4,10 @@ log/
 
 # imported repositories
 pymoveit2/
+ar4_ros_driver/
+Grounded-Segment-Anything/
+easy_handeye2/
+ros2_aruco/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
