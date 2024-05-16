@@ -6,7 +6,7 @@ repositories:
   ar4_ros_driver:
     type: git
     url: https://github.com/ycheng517/ar4_ros_driver.git
-  Grounded-Segment-Anything:
+  Grounded-Segment-Anything/Grounded-Segment-Anything:
     type: git
     url: https://github.com/IDEA-Research/Grounded-Segment-Anything
 
