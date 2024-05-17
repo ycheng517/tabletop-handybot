@@ -1,4 +1,27 @@
-# tabletop-assistant
+# Tabletop HandyBot
+
+A low-cost AI powered robotic arm assistant that listens to your voice commands 
+and can carry out a variety of tabletop tasks. Currently it can pick and place 
+arbitrary objects presented in front of it. The total BOM is around $2300 USD.
+
+## Video Demo
+
+[![Tabletop HandyBot Video Demo](./assets/video_thumbnail.png)](https://youtube.com/shorts/fsCkS7HvgGo?si=fMexLrwkxx_plGpd)
+
+## System Architecture
+
+![System Architecture](./assets/architecture_diagram.png)
+
+### Technology Used
+
+- [AR4 Robot](https://www.anninrobotics.com/): a $2000 robot arm that can lift 5lb dumbbells
+    - [ar4_ros_driver](https://github.com/ycheng517/ar4_ros_driver): ROS driver for the arm
+- [Realsense D435](https://store.intelrealsense.com/buy-intel-realsense-depth-camera-d435.html?_ga=2.156205052.639062113.1715864879-1357777019.1715864879): a reliable $300 RGBD camera
+    - [realsense-ros](https://github.com/IntelRealSense/realsense-ros): ROS wrapper for the camera
+- [Whisper Mic](https://github.com/mallorbc/whisper_mic): Convenient library for using OpenAI Whisper with a microphone
+- [Grounding DINO](https://github.com/IDEA-Research/Grounded-Segment-Anything/tree/main/GroundingDINO) A SOTA zero-shot object detector that can detect any object.
+- [Segment Anything](https://github.com/IDEA-Research/Grounded-Segment-Anything/tree/main/segment_anything): A SOTA zero-shot object segmentation model that can segment any object.
+- [OpenAI Assistants](https://platform.openai.com/docs/assistants/overview): an API that calls ChatGPT with specific instructions and function calls
 
 ## Setup
 
