@@ -2,7 +2,7 @@ repositories:
   pymoveit2:
     type: git
     url: https://github.com/ycheng517/pymoveit2.git
-    version: master
+    version: devel
   ar4_ros_driver:
     type: git
     url: https://github.com/ycheng517/ar4_ros_driver.git

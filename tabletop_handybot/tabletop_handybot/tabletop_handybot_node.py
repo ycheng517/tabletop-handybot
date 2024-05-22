@@ -35,13 +35,14 @@ from .point_cloud_conversion import point_cloud_to_msg
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # GroundingDINO config and checkpoint
-GROUNDING_DINO_CONFIG_PATH = "./Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+GROUNDING_DINO_CONFIG_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CHECKPOINT_PATH = (
-    "./Grounded-Segment-Anything/groundingdino_swint_ogc.pth")
+    "./Grounded-Segment-Anything/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
+)
 
 # Segment-Anything checkpoint
 SAM_ENCODER_VERSION = "vit_h"
-SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
+SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
 BOX_THRESHOLD = 0.25
@@ -144,7 +145,7 @@ class GroundedSAMNode(Node):
         self.pick_object_sub = self.create_subscription(
             Int64, "/pick_object", self.pick_object_cb, 10)
 
-        self.logger.info("Grounded SAM node initialized.")
+        self.logger.info("Tabletop HandyBot node initialized.")
 
     def start(self, msg: String):
         if not self._last_rgb_msg or not self._last_depth_msg:
