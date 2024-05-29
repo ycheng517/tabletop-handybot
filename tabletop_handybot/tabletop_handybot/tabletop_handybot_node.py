@@ -17,6 +17,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, PoseStamped
 from groundingdino.util.inference import Model
 from openai.types.beta import Assistant
+from openai.types.beta.threads import RequiredActionFunctionToolCall
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -45,7 +46,7 @@ SAM_ENCODER_VERSION = "vit_h"
 SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
-BOX_THRESHOLD = 0.25
+BOX_THRESHOLD = 0.35
 TEXT_THRESHOLD = 0.25
 NMS_THRESHOLD = 0.8
 
@@ -63,7 +64,8 @@ def segment(sam_predictor: SamPredictor, image: np.ndarray,
     return np.array(result_masks)
 
 
-class GroundedSAMNode(Node):
+class TabletopHandyBotNode(Node):
+    """Main ROS 2 node for Tabletop HandyBot."""
 
     def __init__(
             self,
@@ -110,7 +112,7 @@ class GroundedSAMNode(Node):
         self.sam.to(device=DEVICE)
         self.sam_predictor = SamPredictor(self.sam)
         self.openai = openai.OpenAI()
-        self.assistant: Assistant = get_or_create_assistant(self.openai)
+        self.assistant: Assistant = get_or_create_assistant(self.openai, "")
 
         self.annotate = annotate
         self.publish_point_cloud = publish_point_cloud
@@ -118,9 +120,10 @@ class GroundedSAMNode(Node):
         self._last_depth_msg = None
         self._last_rgb_msg = None
         self._last_detections: sv.Detections | None = None
+        self._object_in_gripper: bool = False
         self.gripper_squeeze_factor = 0.5
-        self._x_offset = 0.005
-        self._y_offset = 0
+        self._x_offset = 0.0
+        self._y_offset = -0.01
         self._z_offset = 0.08  # accounts for the height of the gripper
 
         self.image_sub = self.create_subscription(Image,
@@ -147,12 +150,87 @@ class GroundedSAMNode(Node):
 
         self.logger.info("Tabletop HandyBot node initialized.")
 
+    def execution_success(self, tool_call: RequiredActionFunctionToolCall,
+                          tool_outputs: List[dict]) -> None:
+        output_dict = {"success": True}
+        tool_outputs.append({
+            "tool_call_id": tool_call.id,
+            "output": json.dumps(output_dict),
+        })
+
+    def execution_failure(self, tool_call: RequiredActionFunctionToolCall,
+                          tool_outputs: List[dict], failure_reason: str):
+        output_dict = {
+            "success": False,
+            "failure_reason": failure_reason,
+        }
+        tool_outputs.append({
+            "tool_call_id": tool_call.id,
+            "output": json.dumps(output_dict),
+        })
+
+    def handle_tool_call(self, tool_call: RequiredActionFunctionToolCall,
+                         rgb_image: np.ndarray, depth_image: np.ndarray,
+                         tool_outputs: List[dict]):
+        if tool_call.function.name == "detect_objects":
+            args = json.loads(tool_call.function.arguments)
+            classes_str = args["object_classes"]
+            classes = classes_str.split(",")
+            self._last_detections = self.detect_objects(rgb_image, classes)
+            detected_classes = [
+                classes[class_id]
+                for class_id in self._last_detections.class_id
+            ]
+            self.logger.info(f"Detected {detected_classes}.")
+            self.logger.info(
+                f"detection confidence: {self._last_detections.confidence}")
+            output_dict = {
+                "object_classes": detected_classes,
+            }
+            tool_outputs.append({
+                "tool_call_id": tool_call.id,
+                "output": json.dumps(output_dict),
+            })
+        elif tool_call.function.name == "pick_object":
+            args = json.loads(tool_call.function.arguments)
+            if self._last_detections is None:
+                self.execution_failure(tool_call, tool_outputs,
+                                       "No detections available.")
+                return
+
+            if self._object_in_gripper:
+                self.execution_failure(
+                    tool_call, tool_outputs,
+                    "Gripper is already holding an object.")
+                return
+
+            self.pick_object(args["object_index"], self._last_detections,
+                             depth_image)
+            self._object_in_gripper = True
+            self.execution_success(tool_call, tool_outputs)
+        elif tool_call.function.name == "move_above_object_and_release":
+            args = json.loads(tool_call.function.arguments)
+            if self._last_detections is None:
+                self.execution_failure(tool_call, tool_outputs,
+                                       "No detections available.")
+                return
+
+            self.release_above(args["object_index"], self._last_detections,
+                               depth_image)
+            self._object_in_gripper = False
+            self.execution_success(tool_call, tool_outputs)
+        elif tool_call.function.name == "release_gripper":
+            self.release_gripper()
+            self.execution_success(tool_call, tool_outputs)
+            self._object_in_gripper = False
+
     def start(self, msg: String):
         if not self._last_rgb_msg or not self._last_depth_msg:
             return
 
         rgb_image = self.cv_bridge.imgmsg_to_cv2(self._last_rgb_msg)
         depth_image = self.cv_bridge.imgmsg_to_cv2(self._last_depth_msg)
+        self._last_detections = None
 
         self.logger.info(f"Processing: {msg.data}")
         thread = self.openai.beta.threads.create()
@@ -161,7 +239,7 @@ class GroundedSAMNode(Node):
             role="user",
             content=msg.data,
         )
-        print(message)
+        self.logger.info(str(message))
 
         run = self.openai.beta.threads.runs.create_and_poll(
             thread_id=thread.id,
@@ -169,12 +247,11 @@ class GroundedSAMNode(Node):
         )
 
         done = False
-        detections = None
         while not done:
             if run.status == "completed":
                 messages = self.openai.beta.threads.messages.list(
                     thread_id=thread.id)
-                print(messages)
+                self.logger.info(str(messages))
                 done = True
                 break
             else:
@@ -184,54 +261,10 @@ class GroundedSAMNode(Node):
             for tool_call in run.required_action.submit_tool_outputs.tool_calls:
                 self.logger.info(f"tool_call: {tool_call}")
                 if tool_call.type == "function":
-                    if tool_call.function.name == "get_objects":
-                        args = json.loads(tool_call.function.arguments)
-                        classes_str = args["object_classes"]
-                        classes = classes_str.split(",")
-                        detections = self.detect_objects(rgb_image, classes)
-                        detected_classes = [
-                            classes[class_id]
-                            for class_id in detections.class_id
-                        ]
-                        self.logger.info(f"Detected {detected_classes}.")
-                        output_dict = {
-                            "object_classes": detected_classes,
-                        }
-                        tool_outputs.append({
-                            "tool_call_id": tool_call.id,
-                            "output": json.dumps(output_dict),
-                        })
-                    elif tool_call.function.name == "execute_action":
-                        args = json.loads(tool_call.function.arguments)
-                        if detections is None:
-                            self.logger.error(
-                                "No detections available to execute action.")
-                            output_dict = {
-                                "success": False,
-                                "failure_reason": "No detections available.",
-                            }
-                            tool_outputs.append({
-                                "tool_call_id":
-                                tool_call.id,
-                                "output":
-                                json.dumps(output_dict),
-                            })
-                            continue
-                        self.execute_action(
-                            args["action"],
-                            args["object_index"],
-                            detections,
-                            depth_image,
-                        )
-                        output_dict = {
-                            "success": True,
-                        }
-                        tool_outputs.append({
-                            "tool_call_id": tool_call.id,
-                            "output": json.dumps(output_dict),
-                        })
-            self.logger.info(f"tool_outputs: {tool_outputs}")
+                    self.handle_tool_call(tool_call, rgb_image, depth_image,
+                                          tool_outputs)
 
+            self.logger.info(f"tool_outputs: {tool_outputs}")
             if tool_outputs:
                 try:
                     run = self.openai.beta.threads.runs.submit_tool_outputs_and_poll(
@@ -313,20 +346,6 @@ class GroundedSAMNode(Node):
         self.n_frames_processed += 1
         return detections
 
-    def execute_action(
-        self,
-        action: str,
-        object_index: int,
-        detections: sv.Detections,
-        depth_image: np.ndarray,
-    ) -> None:
-        if action == "pick_object":
-            self.pick_object(object_index, detections, depth_image)
-        elif action == "move_above_object_and_release":
-            self.release_above(object_index, detections, depth_image)
-        else:
-            self.logger.error(f"Unknown action: {action}")
-
     def pick_object(self, object_index: int, detections: sv.Detections,
                     depth_image: np.ndarray):
         """Perform a top-down grasp on the object."""
@@ -395,7 +414,7 @@ class GroundedSAMNode(Node):
         self.gripper_interface.wait_until_executed()
 
         # lift the item
-        msg.position.z += 0.05
+        msg.position.z += 0.12
         self.move_to(msg)
         time.sleep(0.05)
 
@@ -435,6 +454,10 @@ class GroundedSAMNode(Node):
         drop_pose.orientation.w = 0.0
 
         self.release_at(drop_pose)
+
+    def release_gripper(self):
+        self.gripper_interface.open()
+        self.gripper_interface.wait_until_executed()
 
     @cached_property
     def cam_to_base_affine(self):
@@ -530,7 +553,7 @@ class GroundedSAMNode(Node):
 
 def main():
     rclpy.init()
-    node = GroundedSAMNode()
+    node = TabletopHandyBotNode()
     executor = MultiThreadedExecutor(4)
     executor.add_node(node)
     try:
