@@ -67,10 +67,11 @@ def segment(sam_predictor: SamPredictor, image: np.ndarray,
 class TabletopHandyBotNode(Node):
     """Main ROS 2 node for Tabletop HandyBot."""
 
-    def __init__(
-            self,
-            annotate: bool = False,
-            publish_point_cloud: bool = False):  # TODO: make args rosparams
+    # TODO: make args rosparams
+    def __init__(self,
+                 annotate: bool = False,
+                 publish_point_cloud: bool = False,
+                 assistant_id: str = "asst_R1Ut8pTsklyeVaSUCEla8jB0"):
         super().__init__("tabletop_handybot_node")
 
         self.logger = self.get_logger()
@@ -112,7 +113,9 @@ class TabletopHandyBotNode(Node):
         self.sam.to(device=DEVICE)
         self.sam_predictor = SamPredictor(self.sam)
         self.openai = openai.OpenAI()
-        self.assistant: Assistant = get_or_create_assistant(self.openai, "")
+        self.assistant: Assistant = get_or_create_assistant(
+            self.openai, assistant_id)
+        self.logger.info(f"Loaded assistant with ID: {self.assistant.id}")
 
         self.annotate = annotate
         self.publish_point_cloud = publish_point_cloud
@@ -204,6 +207,13 @@ class TabletopHandyBotNode(Node):
                     "Gripper is already holding an object.")
                 return
 
+            if args["object_index"] >= len(self._last_detections.mask):
+                self.execution_failure(
+                    tool_call, tool_outputs,
+                    ("Invalid object index. Only "
+                     f"{len(self._last_detections.mask)} objects detected."))
+                return
+
             self.pick_object(args["object_index"], self._last_detections,
                              depth_image)
             self._object_in_gripper = True
@@ -213,6 +223,13 @@ class TabletopHandyBotNode(Node):
             if self._last_detections is None:
                 self.execution_failure(tool_call, tool_outputs,
                                        "No detections available.")
+                return
+
+            if args["object_index"] >= len(self._last_detections.mask):
+                self.execution_failure(
+                    tool_call, tool_outputs,
+                    ("Invalid object index. Only "
+                     f"{len(self._last_detections.mask)} objects detected."))
                 return
 
             self.release_above(args["object_index"], self._last_detections,

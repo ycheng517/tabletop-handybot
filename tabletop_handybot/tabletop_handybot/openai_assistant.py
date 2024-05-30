@@ -30,10 +30,9 @@ def get_or_create_assistant(client: OpenAI,
                             "object_classes": {
                                 "type":
                                 "string",
-                                "description": (
-                                    "Object classes to detect, comma separated",
-                                    "For example: horses,rivers,plain",
-                                ),
+                                "description":
+                                ("Object classes to detect, comma separated"
+                                 "For example: horses,rivers,plain"),
                             }
                         },
                         "required": ["object_classes"],
