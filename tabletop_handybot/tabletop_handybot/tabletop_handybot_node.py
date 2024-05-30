@@ -21,12 +21,14 @@ from openai.types.beta.threads import RequiredActionFunctionToolCall
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.time import Time
 from scipy.spatial.transform import Rotation
 from segment_anything import SamPredictor, sam_model_registry
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Int64, String
+from sensor_msgs.msg import JointState
 
 from pymoveit2 import GripperInterface, MoveIt2
 
@@ -46,7 +48,7 @@ SAM_ENCODER_VERSION = "vit_h"
 SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
 
 # Predict classes and hyper-param for GroundingDINO
-BOX_THRESHOLD = 0.35
+BOX_THRESHOLD = 0.4
 TEXT_THRESHOLD = 0.25
 NMS_THRESHOLD = 0.8
 
@@ -71,7 +73,7 @@ class TabletopHandyBotNode(Node):
     def __init__(self,
                  annotate: bool = False,
                  publish_point_cloud: bool = False,
-                 assistant_id: str = "asst_R1Ut8pTsklyeVaSUCEla8jB0"):
+                 assistant_id: str = ""):
         super().__init__("tabletop_handybot_node")
 
         self.logger = self.get_logger()
@@ -80,12 +82,12 @@ class TabletopHandyBotNode(Node):
         self.gripper_joint_name = "gripper_joint"
         callback_group = ReentrantCallbackGroup()
         # Create MoveIt 2 interface
+        self.arm_joint_names = [
+            "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
+        ]
         self.moveit2 = MoveIt2(
             node=self,
-            joint_names=[
-                "joint_1", "joint_2", "joint_3", "joint_4", "joint_5",
-                "joint_6"
-            ],
+            joint_names=self.arm_joint_names,
             base_link_name="base_link",
             end_effector_name="link_6",
             group_name="ar_manipulator",
@@ -122,11 +124,12 @@ class TabletopHandyBotNode(Node):
         self.n_frames_processed = 0
         self._last_depth_msg = None
         self._last_rgb_msg = None
+        self.arm_joint_state: JointState | None = None
         self._last_detections: sv.Detections | None = None
         self._object_in_gripper: bool = False
         self.gripper_squeeze_factor = 0.5
-        self._x_offset = 0.0
-        self._y_offset = -0.01
+        self._x_offset = 0.01
+        self._y_offset = -0.005
         self._z_offset = 0.08  # accounts for the height of the gripper
 
         self.image_sub = self.create_subscription(Image,
@@ -135,12 +138,18 @@ class TabletopHandyBotNode(Node):
         self.depth_sub = self.create_subscription(
             Image, "/camera/aligned_depth_to_color/image_raw",
             self.depth_callback, 10)
+        self.joint_states_sub = self.create_subscription(
+            JointState, "/joint_states", self.joint_states_callback, 10)
 
         if self.publish_point_cloud:
             self.point_cloud_pub = self.create_publisher(
                 PointCloud2, "/point_cloud", 2)
-        self.prompt_sub = self.create_subscription(String, "/prompt",
-                                                   self.start, 10)
+        self.prompt_sub = self.create_subscription(
+            String,
+            "/prompt",
+            self.start,
+            10,
+            callback_group=MutuallyExclusiveCallbackGroup())
         self.save_images_sub = self.create_subscription(
             String, "/save_images", self.save_images, 10)
         self.detect_objects_sub = self.create_subscription(
@@ -216,6 +225,9 @@ class TabletopHandyBotNode(Node):
 
             self.pick_object(args["object_index"], self._last_detections,
                              depth_image)
+            self.logger.info(
+                f"done picking object. Joint states: {self.arm_joint_state.position}"
+            )
             self._object_in_gripper = True
             self.execution_success(tool_call, tool_outputs)
         elif tool_call.function.name == "move_above_object_and_release":
@@ -240,6 +252,10 @@ class TabletopHandyBotNode(Node):
             self.release_gripper()
             self.execution_success(tool_call, tool_outputs)
             self._object_in_gripper = False
+        elif tool_call.function.name == "flick_wrist_while_release":
+            self.flick_wrist_while_release()
+            self.execution_success(tool_call, tool_outputs)
+            self._object_in_gripper = False
 
     def start(self, msg: String):
         if not self._last_rgb_msg or not self._last_depth_msg:
@@ -250,6 +266,8 @@ class TabletopHandyBotNode(Node):
         self._last_detections = None
 
         self.logger.info(f"Processing: {msg.data}")
+        self.logger.info(
+            f"Initial Joint states: {self.arm_joint_state.position}")
         thread = self.openai.beta.threads.create()
         message = self.openai.beta.threads.messages.create(
             thread_id=thread.id,
@@ -293,6 +311,9 @@ class TabletopHandyBotNode(Node):
                     self.logger.error(f"Failed to submit tool outputs: {e}")
             else:
                 self.logger.info("No tool outputs to submit.")
+
+        self.go_home()
+        self.logger.info("Task completed.")
 
     def detect_objects(self, image: np.ndarray, object_classes: List[str]):
         self.logger.info(f"Detecting objects of classes: {object_classes}")
@@ -476,6 +497,26 @@ class TabletopHandyBotNode(Node):
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
 
+    def flick_wrist_while_release(self):
+        joint_positions = self.arm_joint_state.position
+        joint_positions[4] -= np.deg2rad(30)
+        self.logger.info(f"moving {self.arm_joint_names}")
+        self.logger.info(f"to {joint_positions}")
+        self.moveit2.move_to_configuration(joint_positions,
+                                           self.arm_joint_names,
+                                           tolerance=0.005)
+        self.moveit2.wait_until_executed()
+
+        self.gripper_interface.open()
+        self.gripper_interface.wait_until_executed()
+
+    def go_home(self):
+        joint_positions = [0., 0., 0., 0., 0., 0.]
+        self.moveit2.move_to_configuration(joint_positions,
+                                           self.arm_joint_names,
+                                           tolerance=0.005)
+        self.moveit2.wait_until_executed()
+
     @cached_property
     def cam_to_base_affine(self):
         cam_to_base_link_tf = self.tf_buffer.lookup_transform(
@@ -551,6 +592,21 @@ class TabletopHandyBotNode(Node):
 
     def image_callback(self, msg):
         self._last_rgb_msg = msg
+
+    def joint_states_callback(self, msg: JointState):
+        joint_state = JointState()
+        joint_state.header = msg.header
+        for name in self.arm_joint_names:
+            for i, joint_state_joint_name in enumerate(msg.name):
+                if name == joint_state_joint_name:
+                    joint_state.name.append(name)
+                    joint_state.position.append(msg.position[i])
+                    joint_state.velocity.append(msg.velocity[i])
+                    joint_state.effort.append(msg.effort[i])
+
+        self.arm_joint_state = joint_state
+        # self.logger.info(f"joint_state in: {msg}")
+        # self.logger.info(f"joint_state out: {self.arm_joint_state}")
 
     def save_images(self, msg):
         if not self._last_rgb_msg or not self._last_depth_msg:
