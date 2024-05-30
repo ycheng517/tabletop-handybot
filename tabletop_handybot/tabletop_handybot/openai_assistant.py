@@ -1,12 +1,13 @@
 from openai import OpenAI  # pylint: disable=import-self
 from openai.types.beta import Assistant
 
-ASSISTANT_ID = "asst_WLqCkCKIerFYoaSCEvCmIJdR"
+# pylint: disable=line-too-long
 
 
-def get_or_create_assistant(client: OpenAI) -> Assistant:
-    if ASSISTANT_ID:
-        return client.beta.assistants.retrieve(ASSISTANT_ID)
+def get_or_create_assistant(client: OpenAI,
+                            assistant_id: str = "") -> Assistant:
+    if assistant_id:
+        return client.beta.assistants.retrieve(assistant_id)
 
     return client.beta.assistants.create(
         name="Tabletop Assistant",
@@ -14,11 +15,13 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
             "You are a robot arm mounted on a table. Write and run code to "
             "do tasks on the table. You can only pick up one object at a time."
         ),
+        model="gpt-4o",
+        temperature=0.01,
         tools=[
             {
                 "type": "function",
                 "function": {
-                    "name": "get_objects",
+                    "name": "detect_objects",
                     "description":
                     "Detect objects in the field of view of the camera",
                     "parameters": {
@@ -27,10 +30,9 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
                             "object_classes": {
                                 "type":
                                 "string",
-                                "description": (
-                                    "Object classes to detect, comma separated",
-                                    "For example: horses,rivers,plain",
-                                ),
+                                "description":
+                                ("Object classes to detect, comma separated"
+                                 "For example: horses,rivers,plain"),
                             }
                         },
                         "required": ["object_classes"],
@@ -40,30 +42,54 @@ def get_or_create_assistant(client: OpenAI) -> Assistant:
             {
                 "type": "function",
                 "function": {
-                    "name": "execute_action",
-                    "description": "Run an action on an object.",
+                    "name": "pick_object",
+                    "description":
+                    "Pick up an object from the output of get_objects.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "action": {
-                                "type":
-                                "string",
-                                "enum": [
-                                    "pick_object",
-                                    "move_above_object_and_release",
-                                ],
-                            },
                             "object_index": {
                                 "type":
-                                "int",
+                                "integer",
                                 "description":
-                                "index of the object in the list of detected objects to execute the action for.",
-                            },
+                                "index of target object in the detected objects list to execute the action for."
+                            }
                         },
-                        "required": ["action", "object"],
-                    },
-                },
+                        "required": ["object_index"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "move_above_object_and_release",
+                    "description":
+                    "move the end effector above the object and release the gripper. The object is from the output of get_objects",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "object_index": {
+                                "type":
+                                "integer",
+                                "description":
+                                "index of target object in the detected objects list to execute the action for."
+                            }
+                        },
+                        "required": ["object_index"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "release_gripper",
+                    "description": "Open up the gripper",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
             },
         ],
-        model="gpt-4-turbo",
     )
