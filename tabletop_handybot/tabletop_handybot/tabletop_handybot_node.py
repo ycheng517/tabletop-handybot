@@ -38,14 +38,15 @@ from .point_cloud_conversion import point_cloud_to_msg
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # GroundingDINO config and checkpoint
-GROUNDING_DINO_CONFIG_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-GROUNDING_DINO_CHECKPOINT_PATH = (
-    "./Grounded-Segment-Anything/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
-)
+GSA_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything"
+GROUNDING_DINO_CONFIG_PATH = os.path.join(
+    GSA_PATH, "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(GSA_PATH,
+                                              "groundingdino_swint_ogc.pth")
 
 # Segment-Anything checkpoint
 SAM_ENCODER_VERSION = "vit_h"
-SAM_CHECKPOINT_PATH = "./Grounded-Segment-Anything/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
+SAM_CHECKPOINT_PATH = os.path.join(GSA_PATH, "sam_vit_h_4b8939.pth")
 
 # Predict classes and hyper-param for GroundingDINO
 BOX_THRESHOLD = 0.4
@@ -70,10 +71,16 @@ class TabletopHandyBotNode(Node):
     """Main ROS 2 node for Tabletop HandyBot."""
 
     # TODO: make args rosparams
-    def __init__(self,
-                 annotate: bool = False,
-                 publish_point_cloud: bool = False,
-                 assistant_id: str = ""):
+    def __init__(
+            self,
+            annotate: bool = False,
+            publish_point_cloud: bool = False,
+            assistant_id: str = "",
+            # Adjust these offsets to your needs:
+            offset_x: float = 0.015,
+            offset_y: float = -0.015,
+            offset_z: float = 0.08,  # accounts for the height of the gripper
+    ):
         super().__init__("tabletop_handybot_node")
 
         self.logger = self.get_logger()
@@ -128,9 +135,9 @@ class TabletopHandyBotNode(Node):
         self._last_detections: sv.Detections | None = None
         self._object_in_gripper: bool = False
         self.gripper_squeeze_factor = 0.5
-        self._x_offset = 0.01
-        self._y_offset = -0.005
-        self._z_offset = 0.08  # accounts for the height of the gripper
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.offset_z = offset_z
 
         self.image_sub = self.create_subscription(Image,
                                                   "/camera/color/image_raw",
@@ -418,9 +425,9 @@ class TabletopHandyBotNode(Node):
 
         gripper_opening = min(dimensions)
         grasp_pose = Pose()
-        grasp_pose.position.x = center[0] + self._x_offset
-        grasp_pose.position.y = center[1] + self._y_offset
-        grasp_pose.position.z = grasp_z + self._z_offset
+        grasp_pose.position.x = center[0] + self.offset_x
+        grasp_pose.position.y = center[1] + self.offset_y
+        grasp_pose.position.z = grasp_z + self.offset_z
         top_down_rot = Rotation.from_quat([0, 1, 0, 0])
         extra_rot = Rotation.from_euler("z", gripper_rotation, degrees=True)
         grasp_quat = (extra_rot * top_down_rot).as_quat()
@@ -482,9 +489,9 @@ class TabletopHandyBotNode(Node):
         center, _, _ = cv2.minAreaRect(xy_points)
 
         drop_pose = Pose()
-        drop_pose.position.x = center[0] + self._x_offset
-        drop_pose.position.y = center[1] + self._y_offset
-        drop_pose.position.z = drop_z + self._z_offset
+        drop_pose.position.x = center[0] + self.offset_x
+        drop_pose.position.y = center[1] + self.offset_y
+        drop_pose.position.z = drop_z + self.offset_z
         # Straight down pose
         drop_pose.orientation.x = 0.0
         drop_pose.orientation.y = 1.0
@@ -499,16 +506,15 @@ class TabletopHandyBotNode(Node):
 
     def flick_wrist_while_release(self):
         joint_positions = self.arm_joint_state.position
-        joint_positions[4] -= np.deg2rad(30)
-        self.logger.info(f"moving {self.arm_joint_names}")
-        self.logger.info(f"to {joint_positions}")
+        joint_positions[4] -= np.deg2rad(25)
         self.moveit2.move_to_configuration(joint_positions,
                                            self.arm_joint_names,
                                            tolerance=0.005)
-        self.moveit2.wait_until_executed()
+        time.sleep(3)
 
         self.gripper_interface.open()
         self.gripper_interface.wait_until_executed()
+        self.moveit2.wait_until_executed()
 
     def go_home(self):
         joint_positions = [0., 0., 0., 0., 0., 0.]
